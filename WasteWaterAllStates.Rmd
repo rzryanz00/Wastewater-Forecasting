@@ -1,0 +1,675 @@
+---
+title: "Wastewater All States"
+output: pdf_document
+date: "2025-01-25"
+---
+
+```{r setup, include=FALSE}
+library(epidatr)
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(zoo)
+library(forecast)
+library(astsa)
+library(quantreg)
+library(lubridate)
+library(Metrics)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(purrr)
+
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(36)
+```
+
+Helper functions:
+```{r}
+# The following function prepares a lagged and differenced dataset intended to be
+# used for AR quant regression
+
+prepare_lagged_data <- function(data, column, lags = c(1, 2), differencing = 1) {
+  
+  # Difference specified column in dataset
+  diff_data <- diff(data[[column]], differences = differencing)
+  
+  # get list of lagged columns
+  lagged_vars <- lapply(lags, function(lag) {
+    dplyr::lag(diff_data, lag) # Note that dplyr lag creates NAs at the beginning of the new vector
+  })
+  
+  # Name the columns based on lag order
+  column_names <- paste(column, "_lag", lags, sep="")
+  # Don't forget first column:
+  column_names <- c(paste0(column, "_lag0"),column_names)
+  # Returns vector of column names
+  
+  # Create dataframe and remove rows with NAs created from lagging
+  lagged_df <- data.frame(cbind(diff_data[(max(lags) + 1):length(diff_data)], 
+                                do.call(cbind, lagged_vars)[(max(lags) + 1):length(diff_data), ]))
+  
+  # Assign column names
+  colnames(lagged_df) <- column_names
+  
+  return(lagged_df)
+}
+
+# Create a function that fits quantreg models
+
+# Returns a list of lists. Inner list will always have size 3 where the first entry is the model fit
+# the second entry will be the date it was trained until, and the third entry is the time index.
+fit_quantreg <- function(data, data_column, date_column, start_index, increment, lags, differencing, quantile){
+  # list of lists
+  fitted_mods <- list()
+  n_weeks <- nrow(data)
+  train_until_dates <- seq(from=start_index, to=(n_weeks), by=increment)
+  
+  dataset_list <- lapply(train_until_dates, function(last_date) {
+    data[1:last_date, , drop = FALSE]
+  })
+  
+  
+  # Apply preparation helper function to each dataset:
+  lagged_data_list <- lapply(dataset_list, function(dataset) {
+    prepare_lagged_data(dataset, data_column, lags, differencing)
+  })
+  
+  
+  fit_models_helper <- function(lagged_data){
+    column_names <- colnames(lagged_data)
+    rq(as.formula(paste0(column_names[1], " ~ .")), data = lagged_data, tau = quantile)
+  }
+  
+  #use a for loop here
+  for(i in  1:length(lagged_data_list)) {
+    fitted_model <- fit_models_helper(lagged_data_list[[i]])
+    last_date <- data[[date_column]][[train_until_dates[i]]]
+    time_index <- start_index + (i-1)*increment
+    fitted_mods[[i]] <- list(fitted_model, last_date, time_index)
+  }
+  
+  return(fitted_mods)
+}
+
+
+#Take in a list of models and return a dataframe
+# Differencing and lag should be the same as what was used to fit the model
+# Maybe add these into the returned list to force correctness?
+predict_quantreg_models <- function(model_name, fitted_models, data, data_column, date_column, lags, differencing, h){
+  
+  final_df <- data.frame(
+    model = character(), 
+    date = as.Date(character()), 
+    time_index = integer(),
+    timesteps_ahead = integer(),
+    prediction = numeric()
+    )
+  
+  for (model_idx in 1:length(fitted_models)){
+    model_fit <- fitted_models[[model_idx]][[1]]
+    last_train_date <- fitted_models[[model_idx]][[2]]
+    last_train_index <- fitted_models[[model_idx]][[3]]
+    
+    n_indices = nrow(data)
+    if (last_train_index + h > n_indices) {
+      next #completely skip for now
+    }
+    
+    #Get test data:
+    test_data <- data[1:(last_train_index + 1), ] #+1 to grab covariates at that time step
+    lagged_test_data <- prepare_lagged_data(data = test_data, column = data_column, lags=lags, differencing=differencing)
+    current_prediction <- tail(lagged_test_data, 1)
+    current_df <- as.data.frame(current_prediction)
+    
+    # used to get next values. No +1 because we will predict that next
+    data_seen_so_far <- diff(data[[data_column]][1:last_train_index],differencing)
+    for (i in 1:h){
+      current_prediction <- predict(model_fit, current_df)
+      current_date <- data[[date_column]][last_train_index + i]
+      current_index <- last_train_index + i
+      
+      prediction_df <- data.frame(
+        model = model_name,
+        date = current_date,
+        time_index = current_index,
+        timesteps_ahead = i,
+        prediction = current_prediction
+      )
+      
+      final_df <- rbind(final_df, prediction_df)
+      
+      # Now we need to generate the next covariates. We have a variable number of lags and the
+      # lags may not necessarily be 1 timestep apart
+      # Method: Take the first unlagged column. Add the prediction to it. Take values from this vector
+      # based on the lag argument
+      
+      
+      data_seen_so_far <- c(data_seen_so_far, current_prediction)
+      new_vals <- sapply(lags, function(lag) data_seen_so_far[length(data_seen_so_far) - lag + 1])
+      current_df <- data.frame(matrix(c(current_prediction, new_vals), nrow = 1))
+      # copy over column names
+      colnames(current_df) <- colnames(lagged_test_data)
+    }
+    
+  }
+  return(final_df)
+}
+
+undo_differencing <- function(prediction_df, original_data, pred_data_column, orig_data_column, start_index){
+  original_vals <- c()
+  
+  original_scale_preds <- c()
+  # start index in my case is 7
+  
+  for (i in seq(1,(nrow(prediction_df)-1),2)){
+    pred_diffs <- prediction_df[[pred_data_column]][i:(i+1)]
+    starting_idx <- prediction_df[["time_index"]][i] - 1
+    starting_point <- original_data[[orig_data_column]][starting_idx]
+    pred_orig <- cumsum(c(starting_point, pred_diffs))
+    #remove original point:
+    pred_orig <- pred_orig[2:3]
+    original_scale_preds <- c(original_scale_preds, pred_orig)
+    
+    
+    two_original_points <- original_data[[orig_data_column]][(starting_idx+1):(starting_idx+2)]
+    original_vals <- c(original_vals, two_original_points)
+  }
+  
+  prediction_df$orig_scale_predictions <- original_scale_preds
+  
+  prediction_df$original_values <- original_vals
+
+  return(prediction_df)
+  
+}
+
+# Modified from Exploratory Modeling file to better suit our needs for all states here
+compute_rmse <- function(prediction_df){
+
+  prediction_df$abs_error <- abs(prediction_df$orig_scale_predictions - prediction_df$original_values)
+  
+  one_step_ahead_df <- prediction_df[prediction_df$timesteps_ahead == 1,]
+  
+  return_df <- one_step_ahead_df[, c("date","abs_error")]
+  return (return_df)
+}
+
+# Wastewater helper functions
+#prepare lagged
+prepare_lagged_data_wastewater <- function(data, waste_column, hosp_column, hosp_lags=c(1,2), waste_lags = c(2,3), differencing=1){
+  diff_hosp <- diff(data[[hosp_column]], differences = differencing)
+  diff_waste <- diff(data[[waste_column]], differences = differencing)
+  
+  # Create lagged hospitalization columns
+  lagged_hosp <- lapply(hosp_lags, function(lag) {
+    dplyr::lag(diff_hosp, lag) # Note that dplyr lag creates NAs at the beginning of the new vector
+  })
+  
+  # Create lagged wastewater columns
+  lagged_waste <- lapply(waste_lags, function(lag) {
+    dplyr::lag(diff_waste, lag) # Note that dplyr lag creates NAs at the beginning of the new vector
+  })
+  
+  # Create column names
+  hosp_column_names <- paste(hosp_column, "_lag", hosp_lags, sep="")
+  waste_column_names <- paste(waste_column, "_lag", waste_lags, sep="")
+  column_names <- c(hosp_column_names,waste_column_names)
+  # Don't forget first column:
+  column_names <- c(paste0(hosp_column, "_lag0"),column_names)
+  
+  # Create dataframe
+  max_all_lags <- max(max(hosp_lags),max(waste_lags))
+  
+  final_df <- data.frame(cbind(diff_hosp[(max_all_lags + 1):length(diff_hosp)], # first row/dependent var 
+                                do.call(cbind, lagged_hosp)[(max_all_lags + 1):length(diff_hosp), ],
+                               do.call(cbind, lagged_waste)[(max_all_lags + 1):length(diff_waste), ]))
+  
+  colnames(final_df) <- column_names
+  return(final_df)
+  
+}
+
+
+fit_quantreg_wastewater <- function(data, hosp_column, waste_column, date_column, start_index, increment, differencing, quantile, hosp_lags, waste_lags){
+  # list of lists
+  fitted_mods <- list()
+  n_weeks <- nrow(data)
+  train_until_dates <- seq(from=start_index, to=(n_weeks), by=increment)
+  
+  dataset_list <- lapply(train_until_dates, function(last_date) {
+    data[1:last_date, , drop = FALSE]
+  })
+  
+  
+  # Apply preparation helper function to each dataset:
+  lagged_data_list <- lapply(dataset_list, function(dataset) {
+    prepare_lagged_data_wastewater(data = data,
+                               waste_column=waste_column,
+                               hosp_column=hosp_column,
+                               hosp_lags = hosp_lags,
+                               waste_lags= waste_lags,
+                               differencing=differencing
+                               )
+  })
+  
+  
+  fit_models_helper <- function(lagged_data){
+    column_names <- colnames(lagged_data)
+    rq(as.formula(paste0(column_names[1], " ~ .")), data = lagged_data, tau = quantile)
+  }
+  
+  #use a for loop here
+  for(i in  1:length(lagged_data_list)) {
+    fitted_model <- fit_models_helper(lagged_data_list[[i]])
+    last_date <- data[[date_column]][[train_until_dates[i]]]
+    time_index <- start_index + (i-1)*increment
+    fitted_mods[[i]] <- list(fitted_model, last_date, time_index)
+  }
+  
+  return(fitted_mods)
+}
+
+#Function is not general. Hard-coded for a look-ahead of 2
+predict_quantreg_wasterwater_models <- function(model_name, fitted_models, data, hosp_column, waste_column, date_column, hosp_lags, waste_lags, differencing, h){
+  
+  final_df <- data.frame(
+    model = character(), 
+    date = as.Date(character()), 
+    time_index = integer(),
+    timesteps_ahead = integer(),
+    prediction = numeric()
+    )
+  
+  for (model_idx in 1:length(fitted_models)){
+    model_fit <- fitted_models[[model_idx]][[1]]
+    last_train_date <- fitted_models[[model_idx]][[2]]
+    last_train_index <- fitted_models[[model_idx]][[3]]
+    
+    n_indices = nrow(data)
+    if (last_train_index + h > n_indices) {
+      next #completely skip for now
+    }
+    
+    # h has to be greater than smallest wastewater lag
+    
+    #Get test data:
+    test_data <- data[1:(last_train_index + 2), ] #We are assuming wastewater lags are >= 2
+    lagged_test_data <- prepare_lagged_data_wastewater(data = test_data,
+                               waste_column=waste_column,
+                               hosp_column=hosp_column,
+                               hosp_lags = hosp_lags,
+                               waste_lags= waste_lags,
+                               differencing=differencing
+                               )
+    
+
+    two_row_df <- as.data.frame(tail(lagged_test_data,2))
+    current_df <- two_row_df[1,]
+    for (i in 1:2){
+      current_prediction <- predict(model_fit, current_df)
+      current_date <- data[[date_column]][last_train_index + i]
+      current_index <- last_train_index + i
+      
+      prediction_df <- data.frame(
+        model = model_name,
+        date = current_date,
+        time_index = current_index,
+        timesteps_ahead = i,
+        prediction = current_prediction
+      )
+      
+      final_df <- rbind(final_df, prediction_df)
+      
+      
+      # we are currently looking at AR(2) models, so we will hard-code that here
+      # we just need to replace the first order number with our prediction instead of the actual value
+      two_row_df[2,2] <- current_prediction # first col is actual response and is ignored
+      two_row_df[2,1] <- -99999999 # show that first col is ignored
+
+      current_df <- two_row_df[2,]
+    }
+    
+  }
+  return(final_df)
+}
+
+
+
+```
+
+
+Plots needed:
+
+1. Average predictive performance across time - get one value. Boxplot
+2. Average across states at one time to get time series of each model -> two lines. One for wastewater and one for non-wastewater
+
+I want a dataframe -> each column represents predictive performance of one state
+each row is a time point
+
+Finished
+
+New to do list:
+Boxplots
+1. get naive predictions
+2. implement quantile tracker
+3. Get WIS for naive model, quantile with wastewater, quantile without wastewater for each state
+4. from 3 create a boxplot similar to Gabrielle's
+
+Time series
+Get WIS averaged over all states for each time point for each model. Each model has its own line.
+
+For naive model, quantile with wastewater, quantile without wastewater obtain:
+
+a dataframe where each column is represents a state and each row is a time point and each element is the WIS for that state at that time point. Each model has its own dataframe.
+
+
+
+
+Future: Maybe redo everything but with a linear model?
+
+Also rename compute_rmse function to compute_abs_error
+
+
+```{r}
+#NWSS_data is from this url:
+#https://data.cdc.gov/Public-Health-Surveillance/NWSS-Public-SARS-CoV-2-Concentration-in-Wastewater/g653-rqe2/about_data
+nwss_data <- read.csv("NWSS_data.csv")
+
+#location data is from this url:
+#https://data.cdc.gov/Public-Health-Surveillance/NWSS-Public-SARS-CoV-2-Wastewater-Metric-Data/2ew6-ywp6/about_data
+location_data <- read.csv("location_data.csv")
+
+# We only need one row for each key_plot_id to get the jurisdiction
+distinct_location_data <- location_data %>% distinct(key_plot_id, .keep_all = TRUE)
+
+merged_df <- nwss_data %>%
+  left_join(distinct_location_data %>% select(key_plot_id, wwtp_jurisdiction, county_fips, population_served), by = 'key_plot_id')
+
+```
+
+```{r}
+#load delphi data:
+load("all_state_data.RData")
+```
+
+
+
+
+```{r}
+state_names <- state.name # Gives vector of full state names
+abbreviations <- state.abb # Gives vector of state abbreviations
+non_wastewater_dfs <- list()
+states_found <- c()
+missing_states <- c()
+wastewater_dfs <- list()
+
+
+# for loop over all the states
+for(s in 1:50) {
+  print(s)
+  # Create a list of dataframes to return. One dataframe per state
+  state_name <- state_names[s]
+  state_abb <- abbreviations[s]
+  # Get wastewater data
+  state_waste_data <- merged_df[merged_df$wwtp_jurisdiction == state_name,]
+  # Reformat state_waste_data to follow a univariate time series:
+  # Only consider flow-population normalization to keep things consistent
+  filtered_data <- filter(state_waste_data, normalization == "flow-population")
+  # Make sure the date is being stored as a date type
+  filtered_data$date <- as.Date(filtered_data$date)
+  # Obtain date, pcr concentration, and the key-plot-id associated with each treatment plant
+  filtered_data <- filtered_data %>% select(c("date", "pcr_conc_lin","key_plot_id")) 
+  # Each treatment plant is now a column, with the dates as rows:
+  plants_as_cov_df <- pivot_wider(filtered_data, names_from = key_plot_id, values_from = pcr_conc_lin)
+  # Since a lot of plants have missing data, we want to average across plants for each day to avoid excessive imputation. (It appears that some plants didn't start recording values until halfway through our date range, and some didn't start until the very end)
+  if(ncol(plants_as_cov_df) < 2){
+    print("State possibly has no plants:")
+    print(s)
+    missing_states <- c(missing_states, state_name)
+    next
+  }
+  plants_as_cov_df$avg_pcr_conc_lin <- rowMeans(plants_as_cov_df[2:ncol(plants_as_cov_df)], na.rm=TRUE)
+  # Finally average daily values into weekly values. This is because plants only record values alternating between every 2 and 5 days. However, hospitalization data reports values daily. Averaging allows for easier comparison.
+  
+  #weekly_plant_data <- plants_as_cov_df %>%
+  #  mutate(week_start = as.Date(cut(plants_as_cov_df$date, "week"))) %>%
+  #  group_by(week_start) %>%
+  #  summarize(week_avg_pcr_conc_lin = mean(avg_pcr_conc_lin, na.rm = TRUE))
+  
+  weekly_plant_data <- plants_as_cov_df %>%
+    mutate(week_start = as.Date(cut(date, "week"))) %>%  # Create week_start column
+    group_by(week_start) %>%
+    summarize(week_avg_pcr_conc_lin = mean(avg_pcr_conc_lin, na.rm = TRUE)) %>%
+    ungroup() %>%
+    complete(week_start = seq(min(week_start), max(week_start), by = "week"))
+  
+  
+  # Get Hospitalization data from DELPHI:
+  # extract df from preloaded data to avoid sending excessive requests
+  delphi_data <- all_state_dfs[[s]]
+
+  delphi_data$date <- as.Date(as.character(delphi_data$date), format="%Y%m%d")
+  weekly_delphi_data <- delphi_data %>%
+    mutate(week_start = as.Date(cut(delphi_data$date, "week"))) %>%
+    group_by(week_start) %>%
+    summarize(week_avg_cov_util = mean(inpatient_bed_covid_utilization, na.rm = TRUE))
+  
+
+  # subset the data so that we only look at dates where we also have wastewater observations:
+  
+  earliest_week <- as.Date(max(range(weekly_plant_data$week_start)[1], range(weekly_delphi_data$week_start)[1]))
+  latest_week <- as.Date(min(range(weekly_plant_data$week_start)[2], range(weekly_delphi_data$week_start)[2]))
+
+  # filter weekly_plant_data:
+  filtered_weekly_plant_data <- weekly_plant_data %>% filter(week_start <= latest_week & week_start >= earliest_week)
+  
+  # filter weekly_delphi_data:
+  filtered_weekly_delphi_data <- weekly_delphi_data %>% filter(week_start <= latest_week & week_start >= earliest_week)
+  
+  # Create the dataset used for models that incorporate wastewater data
+  weekly_hosp_wastewater_data <- filtered_weekly_delphi_data %>% select(week_avg_cov_util) %>% cbind(filtered_weekly_plant_data,.)
+  
+  # Apply log10 transformation to wastewater data:
+  weekly_hosp_wastewater_data$week_avg_pcr_conc_lin <- log10(weekly_hosp_wastewater_data$week_avg_pcr_conc_lin)
+  
+  
+  # Reassign naming
+  weekly_delphi_data <- filtered_weekly_delphi_data
+  weekly_plant_data <- filtered_weekly_plant_data
+  
+  if(s == 21){
+    # printing out the filtered weekly_delphi_data for state s shows that there is one non-zero value with the rest being zeros or NAs. Issue most likely encountered after differencing one time. Also cannot fit a regression on a singular data point.x
+    # print(weekly_delphi_data)
+    next
+  }
+  
+  if(s == 31){
+    # Printing out our filtered data for 31 shows the existence of NAs between values. We can impute or ignore this state.
+    # print(weekly_delphi_data)
+    next
+  }
+  
+  #If filtered data has no overlapping data then we skip:
+  if(nrow(weekly_delphi_data) == 0){
+    print(paste("no overlapping data for state:", s))
+    next
+  } else if (nrow(weekly_delphi_data) <= 8){ # Want to see how many states are removed due to our starting point of 7 weeks in. 8 because we difference
+    print(paste("less than 8 data points for state:", s))
+    next
+  }
+  
+  # Get predictions for naive baseline using last value carried forward.
+  
+  # R treats this as a deep copy
+  naive_preds <- weekly_delphi_data
+  
+  naive_preds$preds <- dplyr::lag(weekly_delphi_data$week_avg_cov_util)
+  
+  # Other models initially train on first 7 weeks and begin throwing out predictions for week 8 and beyond
+  naive_preds$abs_error <- abs(naive_preds$preds - week_avg_cov_util)
+  if(s == 1){
+    print(naive_preds)
+  }
+  
+  
+  # FINISH!!! -----------------------^
+  
+  # Get predictions for non-wastewater models:
+  fitted_mods <- fit_quantreg(data=weekly_delphi_data,data_column="week_avg_cov_util",
+                            date_column="week_start", start_index=7,increment=1,
+                            lags=c(1,2), differencing=1,quantile = 0.5)
+  
+  
+  
+  prediction_df <- predict_quantreg_models(model_name="Quantile Regression", 
+                                         fitted_models=fitted_mods, 
+                                         data=weekly_delphi_data, 
+                                         data_column="week_avg_cov_util",
+                                         date_column="week_start",
+                                         lags=c(1,2),
+                                         differencing=1,
+                                         h=2
+                                        )
+  
+  original_prediction_df <- undo_differencing(prediction_df = prediction_df,
+                  original_data = weekly_delphi_data,
+                  pred_data_column = "prediction",
+                  orig_data_column = "week_avg_cov_util",
+                  start_index=7)
+  
+ 
+  abs_error_df <- compute_rmse(original_prediction_df)
+  
+  non_wastewater_dfs[[s]] <- abs_error_df
+  
+  # Now do the same but for wastewater models
+  
+  # We start at week 7, which may be an issue for states with less than 7 weeks of data.
+  print(paste("nrow:", nrow(weekly_hosp_wastewater_data)))
+  
+  fitted_mods_wastewater <- fit_quantreg_wastewater(data=weekly_hosp_wastewater_data, hosp_column="week_avg_cov_util", waste_column="week_avg_pcr_conc_lin", date_column="week_start", start_index=7, increment=1, differencing=1, quantile=0.5, hosp_lags=c(1,2), waste_lags=c(2,3))
+
+  prediction_wastewater_df <- predict_quantreg_wasterwater_models(model_name="Quantile Regression with Wastewater", fitted_models = fitted_mods_wastewater, data = weekly_hosp_wastewater_data, hosp_column="week_avg_cov_util", waste_column="week_avg_pcr_conc_lin", date_column="week_start", hosp_lags=c(1,2), waste_lags=c(2,3), differencing=1,h=2)
+  
+  original_scale_data_wastewater <- undo_differencing(prediction_df = prediction_wastewater_df, 
+                  original_data = weekly_hosp_wastewater_data, 
+                  pred_data_column = "prediction", 
+                  orig_data_column =  "week_avg_cov_util", 
+                  start_index = 7)
+  
+  wastewater_abs_error_df <- compute_rmse(prediction_df = original_scale_data_wastewater)
+  
+  wastewater_dfs[[s]] <- wastewater_abs_error_df
+  
+
+  states_found <- c(states_found, state_name)
+}
+```
+
+
+
+
+```{r}
+non_wastewater_dfs[[1]]
+```
+
+
+```{r}
+non_wastewater_dfs <- Filter(function(x) !is.null(x), non_wastewater_dfs)
+non_wastewater_final <- reduce(non_wastewater_dfs, full_join, by = "date")
+# Rename columns:
+new_col_names <- c("date", states_found)
+colnames(non_wastewater_final) <- new_col_names
+```
+
+
+
+```{r}
+non_wastewater_final
+```
+
+
+```{r}
+wastewater_dfs[[38]]
+```
+
+
+```{r}
+wastewater_dfs <- Filter(function(x) !is.null(x), wastewater_dfs)
+wastewater_final <- reduce(wastewater_dfs, full_join, by = "date")
+# Rename columns:
+new_col_names <- c("date", states_found)
+colnames(wastewater_final) <- new_col_names
+```
+
+
+```{r}
+wastewater_final
+```
+
+
+
+```{r}
+# Average predictive performance across time - get one value. Make a Boxplot
+
+# Get column means by averaging across all weeks
+wastewater_avg <- colMeans(wastewater_final %>% select(-date), na.rm = TRUE)
+non_wastewater_avg <- colMeans(non_wastewater_final %>% select(-date), na.rm = TRUE)
+
+# Combine vectors into one dataframe
+state_avg_df <- bind_rows(
+  data.frame(avg = wastewater_avg, group = "wastewater"),
+  data.frame(avg = non_wastewater_avg, group = "nonwastewater")
+)
+
+
+```
+
+
+
+
+```{r}
+state_avg_df
+```
+
+
+```{r}
+ggplot(state_avg_df, aes(x = group, y = avg, fill = group)) +
+  geom_boxplot() +
+  labs(title = "Overall State Prediction Errors by Model Type ",
+       x = "",
+       y = "Average Weekly Absolute Error") +
+  theme_minimal()
+```
+
+
+
+```{r}
+# Make a time series plot for each model type by averaging across states:
+
+#Get Row Means
+wastewater_weekly_avg <- data.frame(date = wastewater_final$date, avg = rowMeans(wastewater_final %>% select(-date), na.rm=TRUE))
+
+non_wastewater_weekly_avg <-data.frame(date=non_wastewater_final$date, avg =  rowMeans(non_wastewater_final %>% select(-date), na.rm=TRUE))
+
+# Join the dataframes by their date:
+ts_df <- full_join(wastewater_weekly_avg, non_wastewater_weekly_avg, by = "date", suffix = c("_wastewater", "_non_wastewater"))
+
+```
+
+
+```{r}
+
+ggplot(ts_df, aes(x = date)) +
+  geom_line(aes(y = avg_wastewater, color = "Wastewater")) +
+  geom_line(aes(y = avg_non_wastewater, color = "Non Wastewater")) +
+  labs(title = "Predictive Error of Each Model Averaged Across States",
+       x = "Date",
+       y = "Average Predictive Error Across All States")
+
+```
+
+```{r}
+ts_df
+```
